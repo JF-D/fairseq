@@ -290,6 +290,31 @@ def replace_gradients_with_last_sample(trainer):
             module.hook_id = idx
             module.register_forward_hook(_pre_backward_module_hook)
 
+def myplot_animation(data_list, name, ylabel='Iteration'):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+    from matplotlib import cm
+
+    fig = plt.figure(dpi=300)
+    ax = fig.add_subplot(111, projection='3d')
+    datas = [act.reshape(-1) for act in data_list]
+    iterations = np.arange(len(data_list))
+    positions = np.arange(datas[0].size)
+    positions, iterations = np.meshgrid(positions, iterations)
+    acts = np.vstack(datas)
+    surf = ax.plot_surface(positions, iterations, acts, rstride=1, cstride=1, cmap=cm.viridis)
+    ax.set_xlabel('Tensor')
+    ax.set_ylabel(ylabel)
+    cbar = fig.colorbar(surf, shrink=1, aspect=30)
+    def data_gen():
+        for angle in range(0, 360, 10):
+            yield angle
+    def run(angle):
+        ax.view_init(30, angle)
+    ani = animation.FuncAnimation(fig, run, data_gen, interval=350, repeat=True)
+    ani.save(name, writer='pillow')
+
 class RecordFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, module, pre_backward_function, outputs):
@@ -327,33 +352,11 @@ def record_last_sample_statistics(trainer):
             if sub_module.applied_pre_backward_ref_cnt > 0:
                 sub_module.applied_pre_backward_ref_cnt -= 1
             if epoch_info[1] >= 100 and module.hook_id == 0:
-                import numpy as np
-                import matplotlib.pyplot as plt
-                import matplotlib.animation as animation
-                from matplotlib import cm
                 print('finish hook!!!')
                 for idx, hook_module in track_modules.items():
-                    def myplot(data_list, name):
-                        fig = plt.figure(dpi=300)
-                        ax = fig.add_subplot(111, projection='3d')
-                        datas = [act[:4, :4, :4].reshape(-1) for act in data_list]
-                        iterations = np.arange(len(data_list))
-                        positions = np.arange(datas[0].size)
-                        positions, iterations = np.meshgrid(positions, iterations)
-                        acts = np.vstack(datas)
-                        surf = ax.plot_surface(positions, iterations, acts, rstride=1, cstride=1, cmap=cm.viridis)
-                        cbar = fig.colorbar(surf, shrink=1, aspect=30)
-                        def data_gen():
-                            for angle in range(0, 360, 10):
-                                yield angle
-                        def run(angle):
-                            ax.view_init(30, angle)
-                        ani = animation.FuncAnimation(fig, run, data_gen, interval=350, repeat=True)
-                        ani.save(name, writer='pillow')
-
                     if torch.distributed.get_rank() == 0:
-                        myplot(hook_module.fw_stats[0], f'log/figs_act/act_value_l{idx}.gif')
-                        myplot(hook_module.bw_stats[0], f'log/figs_act/grad_value_l{idx}.gif')
+                        myplot_animation(hook_module.fw_stats[0], f'log/figs_act/act_value_l{idx}.gif', ylabel='Epoch')
+                        myplot_animation(hook_module.bw_stats[0], f'log/figs_act/grad_value_l{idx}.gif', ylabel='Epoch')
                 exit()
 
         return _apply_to_tensors_only(module,
@@ -371,6 +374,68 @@ def record_last_sample_statistics(trainer):
             module.register_forward_hook(_pre_backward_module_hook)
 
             track_modules[idx] = module
+
+
+class SyntheticFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, module, pre_backward_function, outputs):
+        ctx.module = module
+        ctx.pre_backward_function = pre_backward_function
+        if not hasattr(module, 'applied_pre_backward_ref_cnt'):
+            module.applied_pre_backward_ref_cnt = 0
+        module.applied_pre_backward_ref_cnt += 1
+
+        if not hasattr(module, 'last_output'):
+            module.last_output = outputs.clone().detach()
+
+        if module.vary_input:
+            outputs = outputs.detach() * 1.001
+        else:
+            outputs = module.last_output.clone().detach()
+        if torch.distributed.get_rank() == 0:
+            print(outputs[:2, :2, :2])
+        return outputs
+
+    @staticmethod
+    def backward(ctx, *args):
+        # if not hasattr(ctx.module, 'last_gradient'):
+        #     ctx.module.last_gradient = args[0].clone().detach()
+        ctx.pre_backward_function(ctx.module, *args)
+        return (None, None) + args
+
+KEEP_FIRST_SAMPLE = False
+def synthetic_input_module(cfg, trainer, module_id, vary_input=False):
+    global KEEP_FIRST_SAMPLE
+    KEEP_FIRST_SAMPLE = True
+    def _pre_backward_module_hook(module, inputs, output):
+        def _run_before_backward_function(sub_module, *args):
+            if sub_module.applied_pre_backward_ref_cnt > 0:
+                module.grad_stats.append(args[0][:4, :4, :4].clone().detach().cpu().numpy())
+                sub_module.applied_pre_backward_ref_cnt -= 1
+
+            if len(module.grad_stats) >= 100:
+                ep = cfg.checkpoint.restore_file.split('/')[-1][10:].split('.')[0]
+                if torch.distributed.get_rank() == 0:
+                    if vary_input:
+                        fig_name = f'log/figs_sim/sim_l{module_id}_ep{ep}.gif'
+                    else:
+                        fig_name = f'log/figs_sim/eq_l{module_id}_ep{ep}.gif'
+                    myplot_animation(module.grad_stats, fig_name)
+                exit()
+
+        return _apply_to_tensors_only(module,
+                                      SyntheticFunction,
+                                      _run_before_backward_function,
+                                      output)
+
+    module_lists = list(trainer.model.module.module.encoder.layers.named_children())
+    module_lists += list(trainer.model.module.module.decoder.layers.named_children())
+    for idx, (name, module) in enumerate(module_lists):
+        if idx == module_id:
+            module.hook_id = idx
+            module.vary_input = vary_input
+            module.grad_stats = []
+            module.register_forward_hook(_pre_backward_module_hook)
 
 
 def main(cfg: FairseqConfig) -> None:
@@ -516,8 +581,10 @@ def main(cfg: FairseqConfig) -> None:
     # >>> replace gradients with last epoch sample
     # if torch.distributed.get_rank() == 0:
     #     replace_gradients_with_last_sample(trainer)
-    # if torch.distributed.get_rank() == 0:
-    #     record_last_sample_statistics(trainer)
+    # >>> record last sample statistics
+    # record_last_sample_statistics(trainer)
+    # >>> synchetic gradient module
+    # synthetic_input_module(cfg, trainer, 9, vary_input=False)
 
     train_meter = meters.StopwatchMeter()
     train_meter.start()
@@ -667,10 +734,17 @@ def train(
     should_stop = False
     num_updates = trainer.get_num_updates()
     logger.info("Start iterating over samples")
-    global current_sample, epoch_info, RECORD_LAST_SAMPLE
+    global current_sample, epoch_info, RECORD_LAST_SAMPLE, KEEP_FIRST_SAMPLE
     epoch_info[2] = False
     for i, samples in enumerate(progress):
-        current_sample = samples
+        if KEEP_FIRST_SAMPLE:
+            if current_sample is None:
+                current_sample = samples
+            samples = current_sample
+        else:
+            current_sample = samples
+        if torch.distributed.get_rank() == 0:
+            print(samples[0]['id'][:10])
         if RECORD_LAST_SAMPLE:
             epoch_info = [i, epoch_info[1], epoch_info[2]]
             epoch_info[2] = (epoch_info[0] >= 1)
