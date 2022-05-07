@@ -249,17 +249,13 @@ def parameter_statistics(cfg, trainer, task):
     exit()
 
 disable_shuffle = False
-current_sample, first_epoch = None, True
+current_sample, first_epoch, epoch_info = None, True, [0, 0, False]
 
 def replace_gradients_with_last_sample(trainer):
     global current_sample, first_epoch, disable_shuffle
     disable_shuffle = True
     def _pre_backward_module_hook(module, inputs, output):
         def _run_before_backward_function(sub_module, *args):
-            # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
-            # before doing backwards, so each backward will need a pre-fetch - using reference
-            # counting to support this scenario
-            # print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
             if sub_module.applied_pre_backward_ref_cnt > 0:
 
                 key = tuple(list(current_sample[0]['id'].cpu().numpy()))
@@ -281,7 +277,6 @@ def replace_gradients_with_last_sample(trainer):
 
                 sub_module.applied_pre_backward_ref_cnt -= 1
                 return (None, None) + args
-            #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
 
         return _apply_to_tensors_only(module,
                                       PreBackwardFunction,
@@ -294,6 +289,88 @@ def replace_gradients_with_last_sample(trainer):
         if idx in [5]:
             module.hook_id = idx
             module.register_forward_hook(_pre_backward_module_hook)
+
+class RecordFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, module, pre_backward_function, outputs):
+        ctx.module = module
+        ctx.pre_backward_function = pre_backward_function
+        if not hasattr(module, 'applied_pre_backward_ref_cnt'):
+            module.applied_pre_backward_ref_cnt = 0
+        module.applied_pre_backward_ref_cnt += 1
+        # print(f"After Forward: {ctx.module.__class__.__name__}")
+        global epoch_info
+        if epoch_info[1] == 1:
+            module.fw_stats[epoch_info[0]] = []
+        module.fw_stats[epoch_info[0]].append(outputs[:4, :4, :4].clone().detach().cpu().numpy())
+        outputs = outputs.detach()
+        return outputs
+
+    @staticmethod
+    def backward(ctx, *args):
+        # print(f"Before Backward: {ctx.module.__class__.__name__}")
+        global epoch_info
+        if epoch_info[1] == 1:
+            ctx.module.bw_stats[epoch_info[0]] = []
+        ctx.module.bw_stats[epoch_info[0]].append(args[0][:4, :4, :4].clone().detach().cpu().numpy())
+        ctx.pre_backward_function(ctx.module, *args)
+        return (None, None) + args
+
+RECORD_LAST_SAMPLE = False
+def record_last_sample_statistics(trainer):
+    global disable_shuffle, epoch_info, RECORD_LAST_SAMPLE
+    RECORD_LAST_SAMPLE = True
+    disable_shuffle = True
+    track_modules = {}
+    def _pre_backward_module_hook(module, inputs, output):
+        def _run_before_backward_function(sub_module, *args):
+            if sub_module.applied_pre_backward_ref_cnt > 0:
+                sub_module.applied_pre_backward_ref_cnt -= 1
+            if epoch_info[1] >= 100 and module.hook_id == 0:
+                import numpy as np
+                import matplotlib.pyplot as plt
+                import matplotlib.animation as animation
+                from matplotlib import cm
+                print('finish hook!!!')
+                for idx, hook_module in track_modules.items():
+                    def myplot(data_list, name):
+                        fig = plt.figure(dpi=300)
+                        ax = fig.add_subplot(111, projection='3d')
+                        datas = [act[:4, :4, :4].reshape(-1) for act in data_list]
+                        iterations = np.arange(len(data_list))
+                        positions = np.arange(datas[0].size)
+                        positions, iterations = np.meshgrid(positions, iterations)
+                        acts = np.vstack(datas)
+                        surf = ax.plot_surface(positions, iterations, acts, rstride=1, cstride=1, cmap=cm.viridis)
+                        cbar = fig.colorbar(surf, shrink=1, aspect=30)
+                        def data_gen():
+                            for angle in range(0, 360, 10):
+                                yield angle
+                        def run(angle):
+                            ax.view_init(30, angle)
+                        ani = animation.FuncAnimation(fig, run, data_gen, interval=350, repeat=True)
+                        ani.save(name, writer='pillow')
+
+                    if torch.distributed.get_rank() == 0:
+                        myplot(hook_module.fw_stats[0], f'log/figs_act/act_value_l{idx}.gif')
+                        myplot(hook_module.bw_stats[0], f'log/figs_act/grad_value_l{idx}.gif')
+                exit()
+
+        return _apply_to_tensors_only(module,
+                                      RecordFunction,
+                                      _run_before_backward_function,
+                                      output)
+
+    module_lists = list(trainer.model.module.module.encoder.layers.named_children())
+    module_lists += list(trainer.model.module.module.decoder.layers.named_children())
+    for idx, (name, module) in enumerate(module_lists):
+        if idx in [0, 2, 5, 7, 9]:
+            module.hook_id = idx
+            module.fw_stats = {}
+            module.bw_stats = {}
+            module.register_forward_hook(_pre_backward_module_hook)
+
+            track_modules[idx] = module
 
 
 def main(cfg: FairseqConfig) -> None:
@@ -439,6 +516,8 @@ def main(cfg: FairseqConfig) -> None:
     # >>> replace gradients with last epoch sample
     # if torch.distributed.get_rank() == 0:
     #     replace_gradients_with_last_sample(trainer)
+    # if torch.distributed.get_rank() == 0:
+    #     record_last_sample_statistics(trainer)
 
     train_meter = meters.StopwatchMeter()
     train_meter.start()
@@ -450,6 +529,17 @@ def main(cfg: FairseqConfig) -> None:
                 f"(--stop-min-lr={cfg.optimization.stop_min_lr})"
             )
             break
+        global epoch_info, RECORD_LAST_SAMPLE
+        if RECORD_LAST_SAMPLE:
+            epoch_info[1] += 1
+            cfg.checkpoint['restore_file'] = f'checkpoints/en-de-base/checkpoint{epoch_info[1]}.pt'
+            cfg.reset_dataloader = True
+            checkpoint_utils.load_checkpoint(
+                cfg.checkpoint,
+                trainer,
+                # don't cache epoch iterators for sharded datasets
+                disable_iterator_cache=task.has_sharded_data("train"),
+            )
 
         # train for one epoch
         valid_losses, should_stop = train(cfg, trainer, task, epoch_itr)
@@ -577,9 +667,16 @@ def train(
     should_stop = False
     num_updates = trainer.get_num_updates()
     logger.info("Start iterating over samples")
-    global current_sample
+    global current_sample, epoch_info, RECORD_LAST_SAMPLE
+    epoch_info[2] = False
     for i, samples in enumerate(progress):
         current_sample = samples
+        if RECORD_LAST_SAMPLE:
+            epoch_info = [i, epoch_info[1], epoch_info[2]]
+            epoch_info[2] = (epoch_info[0] >= 1)
+            if epoch_info[2]:
+                valid_losses, should_stop = [0], False
+                break
         with metrics.aggregate("train_inner"), torch.autograd.profiler.record_function(
             "train_step-%d" % i
         ):
