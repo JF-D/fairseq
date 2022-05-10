@@ -897,6 +897,9 @@ class Trainer(object):
                 total_train_time / self.data_parallel_world_size
             )
 
+        if hasattr(self, 'hook_before_grad_reduce'):
+            self.hook_before_grad_reduce()
+
         overflow = False
         try:
             with torch.autograd.profiler.record_function("reduce-grads"):

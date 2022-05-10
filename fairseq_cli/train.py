@@ -12,6 +12,8 @@ import logging
 import math
 import os
 import sys
+import random
+import pickle
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # We need to setup root logger before importing any fairseq libraries.
@@ -438,6 +440,76 @@ def synthetic_input_module(cfg, trainer, module_id, vary_input=False):
             module.register_forward_hook(_pre_backward_module_hook)
 
 
+class MimicDelayedGrad:
+    def __init__(self, trainer):
+        self.partition_id = []
+        self.parameter_map = {}
+        self.gradient_hist = {}
+        self.all_names = []
+
+        cur_part = 0
+        last_param_name = ['encoder.layers.3', 'decoder.layers.0', 'decoder.layers.3']
+        for name, param in trainer.model.module.named_parameters():
+            if len(last_param_name) > cur_part and last_param_name[cur_part] in name:
+                self.partition_id.append(len(self.all_names))
+                cur_part += 1
+            self.all_names.append(name)
+            self.parameter_map[name] = param
+            self.gradient_hist[name] = param.grad.clone().detach()
+        self.partition_id.append(len(self.all_names))
+
+        self.normal = True
+        self.cnt = 0
+        self.module_id = -1
+        self.niters = 0
+
+        self.multi_preemption = True
+
+        self.preempt_hist = []
+        self.prob = 0.05
+        print(f'[Mimic Preemption] prob: {self.prob}')
+
+    def run(self):
+        self.cnt += 1
+        if self.normal:
+            npreemption = 1
+            if not self.multi_preemption:
+                random.seed(self.cnt)
+                npreemption = 4
+            for _ in range(npreemption):
+                if random.random() < self.prob:
+                    # break one node
+                    module_id = random.randint(0, 3)
+                    niters = random.randint(0, 20)
+                    if module_id >= self.module_id:
+                        self.module_id = module_id
+                        self.niters = max(self.niters, niters)
+                    self.normal = False
+        # delay gradient
+        if not self.normal:
+            self.niters -= 1
+            for name in self.all_names[:self.partition_id[self.module_id]]:
+                self.parameter_map[name].grad = self.gradient_hist[name].clone().detach()
+        # update
+        for name in self.all_names:
+            self.gradient_hist[name] = self.parameter_map[name].grad.clone().detach()
+
+        self.preempt_hist.append(self.module_id)
+        if self.niters <= 0:
+            self.normal = True
+            self.module_id = -1
+
+        if torch.distributed.get_rank() == 0:
+            if len(self.preempt_hist) % 5000 == 0:
+                print('Save preemption history')
+                with open('log/hist', 'wb') as fp:
+                    pickle.dump(self.preempt_hist, fp)
+
+def mimic_delay_gradient(trainer):
+    hook = MimicDelayedGrad(trainer)
+    trainer.hook_before_grad_reduce = hook.run
+
+
 def main(cfg: FairseqConfig) -> None:
     if isinstance(cfg, argparse.Namespace):
         cfg = convert_namespace_to_omegaconf(cfg)
@@ -743,8 +815,6 @@ def train(
             samples = current_sample
         else:
             current_sample = samples
-        if torch.distributed.get_rank() == 0:
-            print(samples[0]['id'][:10])
         if RECORD_LAST_SAMPLE:
             epoch_info = [i, epoch_info[1], epoch_info[2]]
             epoch_info[2] = (epoch_info[0] >= 1)
