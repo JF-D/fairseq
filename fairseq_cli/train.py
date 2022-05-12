@@ -62,7 +62,6 @@ def grad_statistics(cfg, trainer):
                 if torch.distributed.get_rank() == 0:
                     print(f'  plot {idx}...')
                 assert len(hook_module.hook_grads) >= niters
-                import numpy as np
                 import matplotlib.pyplot as plt
                 from matplotlib import cm
 
@@ -219,7 +218,6 @@ def parameter_statistics(cfg, trainer, task):
             w = list(module.parameters())[-4][:4, :16].clone().detach().cpu().numpy().reshape(-1)
             parameters[idx].append(w)
 
-    import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
     from matplotlib import cm
@@ -293,7 +291,6 @@ def replace_gradients_with_last_sample(trainer):
             module.register_forward_hook(_pre_backward_module_hook)
 
 def myplot_animation(data_list, name, ylabel='Iteration'):
-    import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
     from matplotlib import cm
@@ -348,24 +345,61 @@ def record_last_sample_statistics(trainer):
     global disable_shuffle, epoch_info, RECORD_LAST_SAMPLE
     RECORD_LAST_SAMPLE = True
     disable_shuffle = True
-    track_modules = {}
+    track_modules, track_params = {}, {}
     def _pre_backward_module_hook(module, inputs, output):
         def _run_before_backward_function(sub_module, *args):
             if sub_module.applied_pre_backward_ref_cnt > 0:
                 sub_module.applied_pre_backward_ref_cnt -= 1
-            if epoch_info[1] >= 100 and module.hook_id == 0:
-                print('finish hook!!!')
-                for idx, hook_module in track_modules.items():
-                    if torch.distributed.get_rank() == 0:
-                        myplot_animation(hook_module.fw_stats[0], f'log/figs_act/act_value_l{idx}.gif', ylabel='Epoch')
-                        myplot_animation(hook_module.bw_stats[0], f'log/figs_act/grad_value_l{idx}.gif', ylabel='Epoch')
-                exit()
 
         return _apply_to_tensors_only(module,
                                       RecordFunction,
                                       _run_before_backward_function,
                                       output)
 
+    stats = {}
+    def track_param_gradient_direction():
+        if epoch_info[0] == 0 and torch.distributed.get_rank() == 0:
+            for idx, param_list in track_params.items():
+                for i, param in enumerate(param_list):
+                    stats[idx][i].append(param.grad.clone().detach().cpu().numpy())
+        if epoch_info[1] >= 100:
+            if torch.distributed.get_rank() != 0:
+                exit()
+            print('finish hook!!!')
+            import matplotlib.pyplot as plt
+            for idx, hook_module in track_modules.items():
+                if torch.distributed.get_rank() == 0:
+                    myplot_animation(hook_module.fw_stats[0], f'log/figs_act/act_value_l{idx}.gif', ylabel='Epoch')
+                    myplot_animation(hook_module.bw_stats[0], f'log/figs_act/grad_value_l{idx}.gif', ylabel='Epoch')
+            for idx, grads_list in stats.items():
+                directions, norms = {}, {}
+                for i, grads in enumerate(grads_list):
+                    directions[i], norms[i] = [], []
+                    for j in range(len(grads)):
+                        norms[i].append(np.linalg.norm(grads[j]))
+                        if j == 0:
+                            directions[i].append(0)
+                        else:
+                            sim = np.dot(grads[j].reshape(-1), grads[j - 1].reshape(-1)) / (norms[i][j] * norms[i][j - 1])
+                            directions[i].append(sim)
+                x = np.arange(len(norms[0]))
+                fig, ax = plt.subplots(dpi=300)
+                ax.bar(x - 0.2, norms[0], width=0.4, color='#67AB9F', label='Linear Grad Norm')
+                ax.bar(x + 0.2, norms[1], width=0.4, color='#A680B8', label='LayerNorm grad Norm')
+                rax = ax.twinx()
+                rax.plot(x, directions[0], label='Linear Grad Sim', marker='o')
+                rax.plot(x, directions[1], label='LayerNorm Grad Sim', marker='x')
+
+                ax.set_ylabel('Norms')
+                rax.set_ylabel('Similarity (cos value)')
+                ax.set_xlabel('Epoch')
+                ax.legend()
+                rax.legend()
+                ax.set_title(f'param_direction_module_{idx}')
+                fig.savefig(f'log/figs_act/param_direction_l{idx}.pdf')
+            exit()
+
+    trainer.hook_before_grad_reduce = track_param_gradient_direction
     module_lists = list(trainer.model.module.module.encoder.layers.named_children())
     module_lists += list(trainer.model.module.module.decoder.layers.named_children())
     for idx, (name, module) in enumerate(module_lists):
@@ -376,6 +410,8 @@ def record_last_sample_statistics(trainer):
             module.register_forward_hook(_pre_backward_module_hook)
 
             track_modules[idx] = module
+            track_params[idx] = [list(module.parameters())[-4], list(module.parameters())[-2]]
+            stats[idx] = [[], []]
 
 
 class SyntheticFunction(torch.autograd.Function):
@@ -394,8 +430,6 @@ class SyntheticFunction(torch.autograd.Function):
             outputs = outputs.detach() * 1.001
         else:
             outputs = module.last_output.clone().detach()
-        if torch.distributed.get_rank() == 0:
-            print(outputs[:2, :2, :2])
         return outputs
 
     @staticmethod
@@ -412,24 +446,68 @@ def synthetic_input_module(cfg, trainer, module_id, vary_input=False):
     def _pre_backward_module_hook(module, inputs, output):
         def _run_before_backward_function(sub_module, *args):
             if sub_module.applied_pre_backward_ref_cnt > 0:
-                module.grad_stats.append(args[0][:4, :4, :4].clone().detach().cpu().numpy())
-                sub_module.applied_pre_backward_ref_cnt -= 1
-
-            if len(module.grad_stats) >= 100:
-                ep = cfg.checkpoint.restore_file.split('/')[-1][10:].split('.')[0]
                 if torch.distributed.get_rank() == 0:
-                    if vary_input:
-                        fig_name = f'log/figs_sim/sim_l{module_id}_ep{ep}.gif'
-                    else:
-                        fig_name = f'log/figs_sim/eq_l{module_id}_ep{ep}.gif'
-                    myplot_animation(module.grad_stats, fig_name)
-                exit()
+                    module.grad_stats.append(args[0].clone().detach().cpu().numpy())
+                else:
+                    module.grad_stats.append(args[0][:1,:1,:1].clone().detach().cpu().numpy())
+                sub_module.applied_pre_backward_ref_cnt -= 1
 
         return _apply_to_tensors_only(module,
                                       SyntheticFunction,
                                       _run_before_backward_function,
                                       output)
 
+    stats, track_module, track_params = {}, None, {}
+    def track_param_gradient_direction():
+        if torch.distributed.get_rank() == 0:
+            for idx, param_list in track_params.items():
+                for i, param in enumerate(param_list):
+                    stats[idx][i].append(param.grad.clone().detach().cpu().numpy())
+
+        if len(track_module.grad_stats) >= 60:
+            if torch.distributed.get_rank() != 0:
+                exit()
+            import matplotlib.pyplot as plt
+            ep = cfg.checkpoint.restore_file.split('/')[-1][10:].split('.')[0]
+            if vary_input:
+                fig_name = f'log/figs_sim/sim_l{module_id}_ep{ep}.gif'
+            else:
+                fig_name = f'log/figs_sim/eq_l{module_id}_ep{ep}.gif'
+            grad_stats = [g[:4, :4, :4] for g in track_module.grad_stats]
+            myplot_animation(grad_stats, fig_name)
+
+            stats[module_id + 1].append(track_module.grad_stats)
+            for idx, grads_list in stats.items():
+                directions, norms = {}, {}
+                for i, grads in enumerate(grads_list):
+                    directions[i], norms[i] = [], []
+                    for j in range(len(grads)):
+                        norms[i].append(np.linalg.norm(grads[j]))
+                        if j == 0:
+                            directions[i].append(0)
+                        else:
+                            sim = np.dot(grads[j].reshape(-1), grads[j - 1].reshape(-1)) / (norms[i][j] * norms[i][j - 1])
+                            directions[i].append(sim)
+                x = np.arange(len(norms[0]))
+                fig, ax = plt.subplots(dpi=300)
+                ax.bar(x - 0.3, norms[0], width=0.3, color='#67AB9F', label='Linear Grad Norm')
+                ax.bar(x, norms[1], width=0.3, color='#A680B8', label='LayerNorm grad Norm')
+                ax.bar(x + 0.3, norms[2], width=0.3, color='#7EA6E0', label='Activation grad Norm')
+                rax = ax.twinx()
+                rax.plot(x, directions[0], label='Linear Grad Sim', marker='o')
+                rax.plot(x, directions[1], label='LayerNorm Grad Sim', marker='x')
+                rax.plot(x, directions[2], label='Activation Grad Sim', marker='+')
+
+                ax.set_ylabel('Norms')
+                rax.set_ylabel('Similarity (cos value)')
+                ax.set_xlabel('Iteration')
+                ax.legend()
+                rax.legend()
+                ax.set_title(f'param_direction_module_{idx}_ep{ep}')
+                fig.savefig(f'log/figs_sim/param_direction_l{idx}_ep{ep}.pdf')
+            exit()
+
+    trainer.hook_before_grad_reduce = track_param_gradient_direction
     module_lists = list(trainer.model.module.module.encoder.layers.named_children())
     module_lists += list(trainer.model.module.module.decoder.layers.named_children())
     for idx, (name, module) in enumerate(module_lists):
@@ -438,6 +516,10 @@ def synthetic_input_module(cfg, trainer, module_id, vary_input=False):
             module.vary_input = vary_input
             module.grad_stats = []
             module.register_forward_hook(_pre_backward_module_hook)
+            track_module = module
+        elif idx == module_id + 1:
+            track_params[idx] = [list(module.parameters())[-4], list(module.parameters())[-2]]
+            stats[idx] = [[], []]
 
 
 class MimicDelayedGrad:
@@ -508,6 +590,81 @@ class MimicDelayedGrad:
 def mimic_delay_gradient(trainer):
     hook = MimicDelayedGrad(trainer)
     trainer.hook_before_grad_reduce = hook.run
+
+
+class SimiFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, module, pre_backward_function, outputs):
+        ctx.module = module
+        ctx.pre_backward_function = pre_backward_function
+        if not hasattr(module, 'applied_pre_backward_ref_cnt'):
+            module.applied_pre_backward_ref_cnt = 0
+        module.applied_pre_backward_ref_cnt += 1
+
+        module.cur_act = outputs.clone().detach()
+        return outputs
+
+    @staticmethod
+    def backward(ctx, *args):
+        module = ctx.module
+        outputs = ctx.module.cur_act
+        preemption = random.random() < 0.05 and module.init > 50
+
+        with torch.no_grad():
+            if preemption:
+                synthetic_out = torch.zeros_like(args[0])
+
+            act = outputs.clone().detach()
+            act_norm = torch.sum(act * act, dim=(0, 2), keepdim=True)
+            act = act / (act_norm + 1e-7)
+            l = min(act.size(0), module.sample.size(0))
+            sim = torch.einsum('ijk,imk->jm', [module.sample[:l], act[:l]])
+            sim_idx = torch.argmax(sim, dim=0).cpu().numpy()
+
+            for k in range(outputs.size(1)):
+                most_sim = sim[sim_idx[k], k]
+                if not preemption:
+                    if module.init + 1 <= 200 and most_sim < 0.8:
+                        module.gradient[module.init] = args[0][:, k].clone().detach()
+                        module.sample[:l, module.init] = act[:l, k]
+                        module.norm[module.init] = act_norm[0, k, 0]
+                        module.init += 1
+                    else:
+                        module.sample[:l, sim_idx[k]] = act[:l, k]
+                        module.gradient[sim_idx[k]] = args[0][:, k].clone().detach()
+                        module.norm[sim_idx[k]] = act_norm[0, k, 0]
+                else:
+                    grad = module.gradient[sim_idx[k]]
+                    l = min(args[0].size(0), grad.size(0))
+                    synthetic_out[:l, k] = grad[:l] * act_norm[0, k, 0] / (module.norm[sim_idx[k]] + 1e-7)
+
+        if preemption:
+            args = (synthetic_out.detach(), )
+        ctx.pre_backward_function(ctx.module, *args)
+        return (None, None) + args
+
+def mimic_sample_similarity(trainer):
+    def _pre_backward_module_hook(module, inputs, output):
+        def _run_before_backward_function(sub_module, *args):
+            if sub_module.applied_pre_backward_ref_cnt > 0:
+                sub_module.applied_pre_backward_ref_cnt -= 1
+
+        return _apply_to_tensors_only(module,
+                                      SimiFunction,
+                                      _run_before_backward_function,
+                                      output)
+
+    module_lists = list(trainer.model.module.module.encoder.layers.named_children())
+    module_lists += list(trainer.model.module.module.decoder.layers.named_children())
+    for idx, (name, module) in enumerate(module_lists):
+        if idx in [2, 5, 8]:
+            module.hook_id = idx
+            module.init = 0
+            module.norm = {}
+            module.sample = torch.zeros(128, 200, 512).cuda() + 1e-6
+            module.gradient = {k: torch.zeros(128, 512).cuda() for k in range(200)}
+            module.extra_stream = torch.cuda.Stream()
+            module.register_forward_hook(_pre_backward_module_hook)
 
 
 def main(cfg: FairseqConfig) -> None:
@@ -656,7 +813,9 @@ def main(cfg: FairseqConfig) -> None:
     # >>> record last sample statistics
     # record_last_sample_statistics(trainer)
     # >>> synchetic gradient module
-    # synthetic_input_module(cfg, trainer, 9, vary_input=False)
+    # synthetic_input_module(cfg, trainer, 0, vary_input=False)
+    # >>> mimic last sample preemption
+    # mimic_sample_similarity(trainer)
 
     train_meter = meters.StopwatchMeter()
     train_meter.start()
