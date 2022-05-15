@@ -592,6 +592,57 @@ def mimic_delay_gradient(trainer):
     trainer.hook_before_grad_reduce = hook.run
 
 
+class MimicPreemption:
+    def __init__(self, trainer, max_preempt_iters=20, delayed_grad=False, record_preemption=False):
+        self.delayed_grad = delayed_grad
+        self.record_preemption = record_preemption
+        self.max_preempt_iters = max_preempt_iters
+
+        self.parameter_map = {}
+        self.gradient_hist = {}
+        self.partition = {}
+
+        last_param_name = ['encoder.layers.3', 'decoder.layers.0', 'decoder.layers.3']
+
+        cur_part = 0
+        self.partition[cur_part] = []
+        for name, param in trainer.model.module.named_parameters():
+            if len(last_param_name) > cur_part and last_param_name[cur_part] in name:
+                cur_part += 1
+                self.partition[cur_part] = []
+            self.partition[cur_part].append(name)
+            self.parameter_map[name] = param
+            if self.delayed_grad:
+                self.gradient_hist[name] = torch.zeros_like(param)
+
+        self.update = 0
+        self.preemption_iters = [0, 0, 0, 0]
+
+        random.seed(torch.distributed.get_rank())
+        self.prob = 0.05
+        print(f'[Mimic Preemption with Activation Gradient] prob: {self.prob}')
+
+        if self.record_preemption:
+            self.preempt_hist = []
+
+    def run(self):
+        self.update += 1
+        for i in range(len(self.preemption_iters)):
+            if self.preemption_iters[i] > 0:
+                for name in self.partition[i]:
+                    if self.delayed_grad:
+                        self.parameter_map[name].grad = self.gradient_hist[name].clone().detach()
+                    else:
+                        self.parameter_map[name].grad = torch.zeros_like(self.parameter_map[name].grad)
+                self.preemption_iters[i] -= 1
+            else:
+                if self.delayed_grad:
+                    for name in self.partition[i]:
+                        self.gradient_hist[name] = self.parameter_map[name].grad.clone().detach()
+
+            if self.preemption_iters[i] <= 0 and self.update >= 5 and random.random() < self.prob:
+                self.preemption_iters[i] = random.randint(0, self.max_preempt_iters)
+
 class SimiFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, module, pre_backward_function, outputs):
@@ -606,9 +657,10 @@ class SimiFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
+        ctx.pre_backward_function(ctx.module, *args)
         module = ctx.module
         outputs = ctx.module.cur_act
-        preemption = random.random() < 0.05 and module.init > 50
+        preemption = ctx.module.preemption
 
         with torch.no_grad():
             if preemption:
@@ -624,7 +676,9 @@ class SimiFunction(torch.autograd.Function):
             for k in range(outputs.size(1)):
                 most_sim = sim[sim_idx[k], k]
                 if not preemption:
-                    if module.init + 1 <= 200 and most_sim < 0.8:
+                    if not module.update_buffer:
+                        break
+                    if module.init + 1 <= module.nsamples and most_sim < 0.8:
                         module.gradient[module.init] = args[0][:, k].clone().detach()
                         module.sample[:l, module.init] = act[:l, k]
                         module.norm[module.init] = act_norm[0, k, 0]
@@ -640,13 +694,20 @@ class SimiFunction(torch.autograd.Function):
 
         if preemption:
             args = (synthetic_out.detach(), )
-        ctx.pre_backward_function(ctx.module, *args)
         return (None, None) + args
 
 def mimic_sample_similarity(trainer):
+    hook = MimicPreemption(trainer)
+    trainer.hook_before_grad_reduce = hook.run
+
     def _pre_backward_module_hook(module, inputs, output):
         def _run_before_backward_function(sub_module, *args):
             if sub_module.applied_pre_backward_ref_cnt > 0:
+                sub_module.preemption = (hook.preemption_iters[sub_module.hook_id] > 0)
+                if sub_module.hook_id + 1 < len(hook.preemption_iters):
+                    sub_module.update_buffer = (sum(hook.preemption_iters[sub_module.hook_id+1:]) <= 0)
+                else:
+                    sub_module.update_buffer = True
                 sub_module.applied_pre_backward_ref_cnt -= 1
 
         return _apply_to_tensors_only(module,
@@ -654,16 +715,17 @@ def mimic_sample_similarity(trainer):
                                       _run_before_backward_function,
                                       output)
 
+    nsamples = 1024
     module_lists = list(trainer.model.module.module.encoder.layers.named_children())
     module_lists += list(trainer.model.module.module.decoder.layers.named_children())
     for idx, (name, module) in enumerate(module_lists):
         if idx in [2, 5, 8]:
-            module.hook_id = idx
+            module.hook_id = [2, 5, 8].index(idx) + 1
             module.init = 0
             module.norm = {}
-            module.sample = torch.zeros(128, 200, 512).cuda() + 1e-6
-            module.gradient = {k: torch.zeros(128, 512).cuda() for k in range(200)}
-            module.extra_stream = torch.cuda.Stream()
+            module.sample = torch.zeros(128, nsamples, 512).cuda() + 1e-6
+            module.gradient = {k: torch.zeros(128, 512).cuda() for k in range(nsamples)}
+            module.nsamples = nsamples
             module.register_forward_hook(_pre_backward_module_hook)
 
 
@@ -815,7 +877,7 @@ def main(cfg: FairseqConfig) -> None:
     # >>> synchetic gradient module
     # synthetic_input_module(cfg, trainer, 0, vary_input=False)
     # >>> mimic last sample preemption
-    # mimic_sample_similarity(trainer)
+    # mimic_sample_similarity(trainer, max_preempt_iters=5, delayed_grad=True)
 
     train_meter = meters.StopwatchMeter()
     train_meter.start()
