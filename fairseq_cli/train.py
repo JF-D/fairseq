@@ -523,10 +523,23 @@ def synthetic_input_module(cfg, trainer, module_id, vary_input=False):
 
 
 class MimicDelayedGrad:
-    def __init__(self, trainer, max_preempt_iters=20, drop_grad=False, drop_dp=False):
+    """ Mimic preemption with delayed gradients (last iteration parameter gradient).
+
+    default case: Mimic preemption with delayed gradients.
+    drop_grad=True: drop the gradient before preemption node.
+        drop_dp=True: use with drop_grad, drop a data parallel process with preempted nodes.
+        drop_preemption_only=True: use with drop_grad, drop the gradient of preemption node only.
+    """
+    def __init__(self, trainer, max_preempt_iters=20, drop_grad=False, drop_dp=False, drop_preemption_only=False):
         self.max_preempt_iters = max_preempt_iters
         self.drop_grad = drop_grad
         self.drop_dp = drop_dp
+        self.drop_preemption_only = drop_preemption_only
+
+        if self.drop_preemption_only:
+            assert not self.drop_dp and self.drop_grad
+        elif self.drop_dp:
+            assert self.drop_grad
 
         self.parameter_map = {}
         self.gradient_hist = {}
@@ -555,9 +568,11 @@ class MimicDelayedGrad:
     def run(self):
         self.update += 1
 
+        preemptions = [0] * len(self.preemption_iters)
         preemption_depth = 0
         for i in range(len(self.preemption_iters)):
             if self.preemption_iters[i] > 0:
+                preemptions[i] = 1
                 preemption_depth = max(preemption_depth, i + 1)
                 self.preemption_iters[i] -= 1
             if self.preemption_iters[i] <= 0 and self.update >= 5 and random.random() < self.prob:
@@ -566,20 +581,20 @@ class MimicDelayedGrad:
         if self.drop_dp and preemption_depth > 0:
             preemption_depth = len(self.preemption_iters)
 
-        preemptions = torch.tensor([1 if i < preemption_depth else 0 for i in range(len(self.preemption_iters))]).cuda()
-        distributed_utils.all_reduce(preemptions, None)
-        self.last_preemptions = preemptions
+        if not self.drop_preemption_only:
+            preemptions = [1 if i < preemption_depth else 0 for i in range(len(self.preemption_iters))]
 
-        for i in range(preemption_depth):
-            for name in self.partition[i]:
-                if self.drop_grad:
-                    self.parameter_map[name].grad = torch.zeros_like(self.parameter_map[name].grad)
-                else:
-                    self.parameter_map[name].grad = self.gradient_hist[name].clone().detach()
-        if not self.drop_grad:
-            for i in range(preemption_depth, len(self.preemption_iters)):
+        last_preemptions = torch.tensor(preemptions).cuda()
+        distributed_utils.all_reduce(last_preemptions, None)
+        self.last_preemptions = last_preemptions
+
+        for i in range(len(self.preemption_iters)):
+            if preemptions[i] > 0:
                 for name in self.partition[i]:
-                    self.gradient_hist[name] = self.parameter_map[name].grad.clone().detach()
+                    if self.drop_grad:
+                        self.parameter_map[name].grad = torch.zeros_like(self.parameter_map[name].grad)
+                    else:
+                        self.parameter_map[name].grad = self.gradient_hist[name].clone().detach()
 
     def post_scale(self):
         if self.drop_grad:
@@ -591,8 +606,8 @@ class MimicDelayedGrad:
                     for name in self.partition[i]:
                         self.parameter_map[name].grad.data.mul_(self.last_preemptions[i] / 8)
 
-def mimic_delay_gradient(trainer, max_preempt_iters=20, drop_grad=False, drop_dp=True):
-    hook = MimicDelayedGrad(trainer, max_preempt_iters=max_preempt_iters, drop_grad=drop_grad, drop_dp=drop_dp)
+def mimic_delay_gradient(trainer, max_preempt_iters=20, drop_grad=False, drop_dp=True, drop_preemption_only=False):
+    hook = MimicDelayedGrad(trainer, max_preempt_iters=max_preempt_iters, drop_grad=drop_grad, drop_dp=drop_dp, drop_preemption_only=drop_preemption_only)
     trainer.hook_before_grad_reduce = hook.run
     trainer.hook_after_grad_reduce = hook.post_scale
 
@@ -672,11 +687,19 @@ class SimiFunction(torch.autograd.Function):
                 synthetic_out = torch.zeros_like(args[0])
 
             act = outputs.clone().detach()
-            act_norm = torch.sum(act * act, dim=(0, 2), keepdim=True)
-            act = act / (act_norm + 1e-7)
             l = min(act.size(0), module.sample.size(0))
-            sim = torch.einsum('ijk,imk->jm', [module.sample[:l], act[:l]])
-            sim_idx = torch.argmax(sim, dim=0).cpu().numpy()
+            if module.sim_func == 'cosine':
+                act_norm = torch.sum(act * act, dim=(0, 2), keepdim=True)
+                act = act / (act_norm + 1e-7)
+                sim = torch.einsum('ijk,imk->jm', [module.sample[:l], act[:l]])
+                sim_idx = torch.argmax(sim, dim=0).cpu().numpy()
+            elif module.sim_func == 'l2norm':
+                act_ = act[:l].unsqueeze(1)
+                sample_ = module.sample[:l].unsqueeze(2)
+                extra_act_ = torch.norm(act[l:].squeeze(1), dim=[0, -1])
+                extra_sample_ = torch.norm(module.sample[l:].squeeze(2), dim=[0, -1])
+                sim = torch.norm(torch.abs(act_ - sample_), dim=[0, -1]) + extra_act_ + extra_sample_
+                sim_idx = torch.argmin(sim, dim=0).cpu().numpy()
 
             for k in range(outputs.size(1)):
                 most_sim = sim[sim_idx[k], k]
@@ -686,22 +709,27 @@ class SimiFunction(torch.autograd.Function):
                     if module.init + 1 <= module.nsamples and most_sim < 0.8:
                         module.gradient[module.init] = args[0][:, k].clone().detach()
                         module.sample[:l, module.init] = act[:l, k]
-                        module.norm[module.init] = act_norm[0, k, 0]
+                        if module.sim_func == 'cosine':
+                            module.norm[module.init] = act_norm[0, k, 0]
                         module.init += 1
                     else:
                         module.sample[:l, sim_idx[k]] = act[:l, k]
                         module.gradient[sim_idx[k]] = args[0][:, k].clone().detach()
-                        module.norm[sim_idx[k]] = act_norm[0, k, 0]
+                        if module.sim_func == 'cosine':
+                            module.norm[sim_idx[k]] = act_norm[0, k, 0]
                 else:
                     grad = module.gradient[sim_idx[k]]
                     l = min(args[0].size(0), grad.size(0))
-                    synthetic_out[:l, k] = grad[:l] * act_norm[0, k, 0] / (module.norm[sim_idx[k]] + 1e-7)
+                    if module.sim_func == 'cosine':
+                        synthetic_out[:l, k] = grad[:l] * act_norm[0, k, 0] / (module.norm[sim_idx[k]] + 1e-7)
+                    else:
+                        synthetic_out[:l, k] = grad[:l] + 1e-7
 
         if preemption:
             args = (synthetic_out.detach(), )
         return (None, None) + args
 
-def mimic_sample_similarity(trainer, max_preempt_iters=10, delayed_grad=False, nsamples=1024):
+def mimic_sample_similarity(trainer, max_preempt_iters=10, delayed_grad=False, nsamples=1024, sim_func='cosine'):
     hook = MimicPreemption(trainer, max_preempt_iters=max_preempt_iters, delayed_grad=delayed_grad)
     trainer.hook_before_grad_reduce = hook.run
 
@@ -730,6 +758,7 @@ def mimic_sample_similarity(trainer, max_preempt_iters=10, delayed_grad=False, n
             module.sample = torch.zeros(128, nsamples, 512).cuda() + 1e-6
             module.gradient = {k: torch.zeros(128, 512).cuda() for k in range(nsamples)}
             module.nsamples = nsamples
+            module.sim_func = sim_func
             module.register_forward_hook(_pre_backward_module_hook)
 
 
@@ -881,7 +910,7 @@ def main(cfg: FairseqConfig) -> None:
     # >>> synchetic gradient module
     # synthetic_input_module(cfg, trainer, 0, vary_input=False)
     # >>> A3: mimic delay gradient, drop_grad=True can be used as a baseline of drop preemptions
-    # mimic_delay_gradient(trainer, max_preempt_iters=20, drop_grad=False, drop_dp=False)
+    mimic_delay_gradient(trainer, max_preempt_iters=20, drop_grad=False, drop_dp=False, drop_preemption_only=False)
     # >>> combine A2 and A1: mimic last sample preemption
     # mimic_sample_similarity(trainer, max_preempt_iters=5, delayed_grad=False, nsamples=1024)
 
