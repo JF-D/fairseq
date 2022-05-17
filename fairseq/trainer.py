@@ -908,6 +908,9 @@ class Trainer(object):
                 if utils.has_parameters(self.criterion):
                     self.optimizer.all_reduce_grads(self.criterion)
 
+            if hasattr(self, 'hook_after_grad_reduce'):
+                self.hook_after_grad_reduce()
+
             with torch.autograd.profiler.record_function("multiply-grads"):
                 # multiply gradients by (data_parallel_size / sample_size) since
                 # DDP normalizes by the number of data parallel workers for

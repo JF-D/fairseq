@@ -523,73 +523,78 @@ def synthetic_input_module(cfg, trainer, module_id, vary_input=False):
 
 
 class MimicDelayedGrad:
-    def __init__(self, trainer):
-        self.partition_id = []
+    def __init__(self, trainer, max_preempt_iters=20, drop_grad=False, drop_dp=False):
+        self.max_preempt_iters = max_preempt_iters
+        self.drop_grad = drop_grad
+        self.drop_dp = drop_dp
+
         self.parameter_map = {}
         self.gradient_hist = {}
-        self.all_names = []
+        self.partition = {}
+
+        last_param_name = ['encoder.layers.3', 'decoder.layers.0', 'decoder.layers.3']
 
         cur_part = 0
-        last_param_name = ['encoder.layers.3', 'decoder.layers.0', 'decoder.layers.3']
+        self.partition[cur_part] = []
         for name, param in trainer.model.module.named_parameters():
             if len(last_param_name) > cur_part and last_param_name[cur_part] in name:
-                self.partition_id.append(len(self.all_names))
                 cur_part += 1
-            self.all_names.append(name)
+                self.partition[cur_part] = []
+            self.partition[cur_part].append(name)
             self.parameter_map[name] = param
-            self.gradient_hist[name] = param.grad.clone().detach()
-        self.partition_id.append(len(self.all_names))
+            if not self.drop_grad:
+                self.gradient_hist[name] = torch.zeros_like(param)
 
-        self.normal = True
-        self.cnt = 0
-        self.module_id = -1
-        self.niters = 0
+        self.update = 0
+        self.preemption_iters = [0, 0, 0, 0]
 
-        self.multi_preemption = True
-
-        self.preempt_hist = []
+        # random.seed(torch.distributed.get_rank())
         self.prob = 0.05
         print(f'[Mimic Preemption] prob: {self.prob}')
 
     def run(self):
-        self.cnt += 1
-        if self.normal:
-            npreemption = 1
-            if not self.multi_preemption:
-                random.seed(self.cnt)
-                npreemption = 4
-            for _ in range(npreemption):
-                if random.random() < self.prob:
-                    # break one node
-                    module_id = random.randint(0, 3)
-                    niters = random.randint(0, 20)
-                    if module_id >= self.module_id:
-                        self.module_id = module_id
-                        self.niters = max(self.niters, niters)
-                    self.normal = False
-        # delay gradient
-        if not self.normal:
-            self.niters -= 1
-            for name in self.all_names[:self.partition_id[self.module_id]]:
-                self.parameter_map[name].grad = self.gradient_hist[name].clone().detach()
-        # update
-        for name in self.all_names:
-            self.gradient_hist[name] = self.parameter_map[name].grad.clone().detach()
+        self.update += 1
 
-        self.preempt_hist.append(self.module_id)
-        if self.niters <= 0:
-            self.normal = True
-            self.module_id = -1
+        preemption_depth = 0
+        for i in range(len(self.preemption_iters)):
+            if self.preemption_iters[i] > 0:
+                preemption_depth = max(preemption_depth, i + 1)
+                self.preemption_iters[i] -= 1
+            if self.preemption_iters[i] <= 0 and self.update >= 5 and random.random() < self.prob:
+                self.preemption_iters[i] = random.randint(0, self.max_preempt_iters)
 
-        if torch.distributed.get_rank() == 0:
-            if len(self.preempt_hist) % 5000 == 0:
-                print('Save preemption history')
-                with open('log/hist', 'wb') as fp:
-                    pickle.dump(self.preempt_hist, fp)
+        if self.drop_dp and preemption_depth > 0:
+            preemption_depth = len(self.preemption_iters)
 
-def mimic_delay_gradient(trainer):
-    hook = MimicDelayedGrad(trainer)
+        preemptions = torch.tensor([1 if i < preemption_depth else 0 for i in range(len(self.preemption_iters))]).cuda()
+        distributed_utils.all_reduce(preemptions, None)
+        self.last_preemptions = preemptions
+
+        for i in range(preemption_depth):
+            for name in self.partition[i]:
+                if self.drop_grad:
+                    self.parameter_map[name].grad = torch.zeros_like(self.parameter_map[name].grad)
+                else:
+                    self.parameter_map[name].grad = self.gradient_hist[name].clone().detach()
+        if not self.drop_grad:
+            for i in range(preemption_depth, len(self.preemption_iters)):
+                for name in self.partition[i]:
+                    self.gradient_hist[name] = self.parameter_map[name].grad.clone().detach()
+
+    def post_scale(self):
+        if self.drop_grad:
+            for i in range(len(self.preemption_iters)):
+                if self.last_preemptions[i] == 8:
+                    for name in self.partition[i]:
+                        self.parameter_map[name].grad = None
+                elif self.last_preemptions[i] > 0:
+                    for name in self.partition[i]:
+                        self.parameter_map[name].grad.data.mul_(self.last_preemptions[i] / 8)
+
+def mimic_delay_gradient(trainer, max_preempt_iters=20, drop_grad=False, drop_dp=True):
+    hook = MimicDelayedGrad(trainer, max_preempt_iters=max_preempt_iters, drop_grad=drop_grad, drop_dp=drop_dp)
     trainer.hook_before_grad_reduce = hook.run
+    trainer.hook_after_grad_reduce = hook.post_scale
 
 
 class MimicPreemption:
@@ -618,7 +623,7 @@ class MimicPreemption:
         self.update = 0
         self.preemption_iters = [0, 0, 0, 0]
 
-        random.seed(torch.distributed.get_rank())
+        # random.seed(torch.distributed.get_rank())
         self.prob = 0.05
         print(f'[Mimic Preemption with Activation Gradient] prob: {self.prob}')
 
@@ -696,8 +701,8 @@ class SimiFunction(torch.autograd.Function):
             args = (synthetic_out.detach(), )
         return (None, None) + args
 
-def mimic_sample_similarity(trainer):
-    hook = MimicPreemption(trainer)
+def mimic_sample_similarity(trainer, max_preempt_iters=10, delayed_grad=False, nsamples=1024):
+    hook = MimicPreemption(trainer, max_preempt_iters=max_preempt_iters, delayed_grad=delayed_grad)
     trainer.hook_before_grad_reduce = hook.run
 
     def _pre_backward_module_hook(module, inputs, output):
@@ -715,7 +720,6 @@ def mimic_sample_similarity(trainer):
                                       _run_before_backward_function,
                                       output)
 
-    nsamples = 1024
     module_lists = list(trainer.model.module.module.encoder.layers.named_children())
     module_lists += list(trainer.model.module.module.decoder.layers.named_children())
     for idx, (name, module) in enumerate(module_lists):
@@ -869,15 +873,17 @@ def main(cfg: FairseqConfig) -> None:
     # replace_gradients_with_last_iter(trainer)
     # >>> plot parameter statistics
     # parameter_statistics(cfg, trainer, task)
-    # >>> replace gradients with last epoch sample
+    # >>> A1: replace gradients with last epoch sample
     # if torch.distributed.get_rank() == 0:
     #     replace_gradients_with_last_sample(trainer)
     # >>> record last sample statistics
     # record_last_sample_statistics(trainer)
     # >>> synchetic gradient module
     # synthetic_input_module(cfg, trainer, 0, vary_input=False)
-    # >>> mimic last sample preemption
-    # mimic_sample_similarity(trainer, max_preempt_iters=5, delayed_grad=True)
+    # >>> A3: mimic delay gradient, drop_grad=True can be used as a baseline of drop preemptions
+    # mimic_delay_gradient(trainer, max_preempt_iters=20, drop_grad=False, drop_dp=False)
+    # >>> combine A2 and A1: mimic last sample preemption
+    # mimic_sample_similarity(trainer, max_preempt_iters=5, delayed_grad=False, nsamples=1024)
 
     train_meter = meters.StopwatchMeter()
     train_meter.start()
