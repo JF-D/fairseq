@@ -701,14 +701,14 @@ class SimiFunction(torch.autograd.Function):
 
                 sim = torch.zeros(module.nsamples, act.size(1)).cuda()
                 nparts = (act.size(1) + 15) // 16
-                extent = act.size(1) // nparts
+                extent = module.nsamples // nparts
                 for i in range(nparts):
                     st = extent * i
-                    if act.size(1) % nparts > i:
+                    if module.nsamples % nparts > i:
                         st += i
                         ed = st + extent + 1
                     else:
-                        st += act.size(1) % nparts
+                        st += module.nsamples % nparts
                         ed = st + extent
                     sim[st:ed] = torch.norm(torch.abs(act_ - sample_[:, st:ed]), dim=[0, -1])
                 sim = sim + extra_act_ + extra_sample_
@@ -932,7 +932,7 @@ def main(cfg: FairseqConfig) -> None:
     # >>> A3: mimic delay gradient, drop_grad=True can be used as a baseline of drop preemptions
     # mimic_delay_gradient(trainer, p=0.1, max_preempt_iters=20, drop_grad=True, drop_dp=False, drop_preemption_only=True)
     # >>> combine A2 and A1: mimic last sample preemption
-    # mimic_sample_similarity(trainer, p=0.1, max_preempt_iters=20, delayed_grad=False, nsamples=1024, sim_func='l2norm')
+    # mimic_sample_similarity(trainer, p=0.1, max_preempt_iters=10, delayed_grad=False, nsamples=1024, sim_func='l2norm')
 
     train_meter = meters.StopwatchMeter()
     train_meter.start()
