@@ -613,10 +613,8 @@ def mimic_delay_gradient(trainer, p=0.05, max_preempt_iters=20, drop_grad=False,
 
 
 class MimicPreemption:
-    def __init__(self, trainer, p=0.05, max_preempt_iters=20, delayed_grad=False, record_preemption=False):
+    def __init__(self, trainer, prob=0.1, iters_per_preemption=10, sec_per_iter=0.2, delayed_grad=False, seed=12345):
         self.delayed_grad = delayed_grad
-        self.record_preemption = record_preemption
-        self.max_preempt_iters = max_preempt_iters
 
         self.parameter_map = {}
         self.gradient_hist = {}
@@ -635,33 +633,32 @@ class MimicPreemption:
             if self.delayed_grad:
                 self.gradient_hist[name] = torch.zeros_like(param)
 
+        from myutils import GenPreemptionTrace
+        self.trace_generators = {}
+        world_size = distributed_utils.get_world_size(None)
+        for i in range(4):
+            rank = world_size * i + distributed_utils.get_rank(None)
+            self.trace_generators[i] = GenPreemptionTrace(world_size * 4, rank, prob=prob,
+                                            iters_per_preemption=iters_per_preemption,
+                                            sec_per_iter=sec_per_iter, seed=seed)
+
         self.update = 0
-        self.preemption_iters = [0, 0, 0, 0]
-
-        # random.seed(torch.distributed.get_rank())
-        self.prob = p
-        print(f'[Mimic Preemption with Activation Gradient] prob: {self.prob}')
-
-        if self.record_preemption:
-            self.preempt_hist = []
+        print(f'[Mimic Preemption with Activation Gradient] prob: {prob}')
 
     def run(self):
-        self.update += 1
-        for i in range(len(self.preemption_iters)):
-            if self.preemption_iters[i] > 0:
+        for i in range(len(self.trace_generators)):
+            if self.trace_generators[i].check_preemption(self.update):
                 for name in self.partition[i]:
                     if self.delayed_grad:
                         self.parameter_map[name].grad = self.gradient_hist[name].clone().detach()
                     else:
                         self.parameter_map[name].grad = torch.zeros_like(self.parameter_map[name].grad)
-                self.preemption_iters[i] -= 1
             else:
                 if self.delayed_grad:
                     for name in self.partition[i]:
                         self.gradient_hist[name] = self.parameter_map[name].grad.clone().detach()
 
-            if self.preemption_iters[i] <= 0 and self.update >= 5 and random.random() < self.prob:
-                self.preemption_iters[i] = random.randint(0, self.max_preempt_iters)
+        self.update += 1
 
 class SimiFunction(torch.autograd.Function):
     @staticmethod
@@ -700,7 +697,7 @@ class SimiFunction(torch.autograd.Function):
                 extra_sample_ = torch.norm(module.sim_sample[l:].squeeze(2), dim=[0, -1]).unsqueeze(1)
 
                 sim = torch.zeros(module.nsamples, act.size(1)).cuda()
-                nparts = (act.size(1) + 15) // 16
+                nparts = (act.size(1) + 31) // 32
                 extent = module.nsamples // nparts
                 for i in range(nparts):
                     st = extent * i
@@ -749,16 +746,23 @@ class SimiFunction(torch.autograd.Function):
             args = (synthetic_out.detach(), )
         return (None, None) + args
 
-def mimic_sample_similarity(trainer, p=0.05, max_preempt_iters=10, delayed_grad=False, nsamples=1024, sim_func='cosine'):
-    hook = MimicPreemption(trainer, p=p, max_preempt_iters=max_preempt_iters, delayed_grad=delayed_grad)
+def mimic_sample_similarity(trainer, p=0.05, iters_per_preemption=10, sec_per_iter=0.2, delayed_grad=False, nsamples=1024, sim_func='l2norm'):
+    # generate seed
+    seed = torch.tensor(random.randint(0, 123)).cuda()
+    distributed_utils.all_reduce(seed, None)
+    seed = seed.item()
+
+    hook = MimicPreemption(trainer, prob=p, iters_per_preemption=iters_per_preemption,
+                           sec_per_iter=sec_per_iter, delayed_grad=delayed_grad, seed=seed)
     trainer.hook_before_grad_reduce = hook.run
 
     def _pre_backward_module_hook(module, inputs, output):
         def _run_before_backward_function(sub_module, *args):
             if sub_module.applied_pre_backward_ref_cnt > 0:
-                sub_module.preemption = (hook.preemption_iters[sub_module.hook_id] > 0)
-                if sub_module.hook_id + 1 < len(hook.preemption_iters):
-                    sub_module.update_buffer = (sum(hook.preemption_iters[sub_module.hook_id+1:]) <= 0)
+                sub_module.preemption = (hook.trace_generators[sub_module.hook_id].check_preemption(hook.update))
+                if sub_module.hook_id + 1 < len(hook.trace_generators):
+                    # TBD: stop update buffer for all preemption
+                    sub_module.update_buffer = True
                 else:
                     sub_module.update_buffer = True
                 sub_module.applied_pre_backward_ref_cnt -= 1
@@ -930,9 +934,11 @@ def main(cfg: FairseqConfig) -> None:
     # >>> synchetic gradient module
     # synthetic_input_module(cfg, trainer, 0, vary_input=False)
     # >>> A3: mimic delay gradient, drop_grad=True can be used as a baseline of drop preemptions
-    # mimic_delay_gradient(trainer, p=0.1, max_preempt_iters=20, drop_grad=True, drop_dp=False, drop_preemption_only=True)
+    # mimic_delay_gradient(trainer, p=0.3, max_preempt_iters=10, drop_grad=True, drop_dp=False, drop_preemption_only=True)
     # >>> combine A2 and A1: mimic last sample preemption
-    # mimic_sample_similarity(trainer, p=0.1, max_preempt_iters=10, delayed_grad=False, nsamples=1024, sim_func='l2norm')
+    # on v100, sec_per_iter=0.2, on A100, sec_per_iter=0.1 (just an estimation!!!)
+    mimic_sample_similarity(trainer, p=0.1, iters_per_preemption=10, sec_per_iter=0.2,
+                            delayed_grad=False, nsamples=1024, sim_func='l2norm')
 
     train_meter = meters.StopwatchMeter()
     train_meter.start()
