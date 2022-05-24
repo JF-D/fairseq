@@ -585,7 +585,7 @@ class MimicDelayedGrad:
             preemptions = [1 if i < preemption_depth else 0 for i in range(len(self.preemption_iters))]
 
         last_preemptions = torch.tensor(preemptions).cuda()
-        distributed_utils.all_reduce(last_preemptions, None)
+        distributed_utils.all_reduce(last_preemptions, distributed_utils.get_data_parallel_group())
         self.last_preemptions = last_preemptions
 
         for i in range(len(self.preemption_iters)):
@@ -635,9 +635,9 @@ class MimicPreemption:
 
         from myutils import GenPreemptionTrace
         self.trace_generators = {}
-        world_size = distributed_utils.get_world_size(None)
+        world_size = distributed_utils.get_world_size(distributed_utils.get_data_parallel_group())
         for i in range(4):
-            rank = world_size * i + distributed_utils.get_rank(None)
+            rank = world_size * i + distributed_utils.get_rank(distributed_utils.get_data_parallel_group())
             self.trace_generators[i] = GenPreemptionTrace(world_size * 4, rank, prob=prob,
                                             iters_per_preemption=iters_per_preemption,
                                             sec_per_iter=sec_per_iter, seed=seed)
@@ -749,7 +749,7 @@ class SimiFunction(torch.autograd.Function):
 def mimic_sample_similarity(trainer, p=0.05, iters_per_preemption=10, sec_per_iter=0.2, delayed_grad=False, nsamples=1024, sim_func='l2norm'):
     # generate seed
     seed = torch.tensor(random.randint(0, 123)).cuda()
-    distributed_utils.all_reduce(seed, None)
+    distributed_utils.all_reduce(seed, distributed_utils.get_data_parallel_group())
     seed = seed.item()
 
     hook = MimicPreemption(trainer, prob=p, iters_per_preemption=iters_per_preemption,
