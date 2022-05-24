@@ -937,7 +937,11 @@ def main(cfg: FairseqConfig) -> None:
     # mimic_delay_gradient(trainer, p=0.3, max_preempt_iters=10, drop_grad=True, drop_dp=False, drop_preemption_only=True)
     # >>> combine A2 and A1: mimic last sample preemption
     # on v100, sec_per_iter=0.2, on A100, sec_per_iter=0.1 (just an estimation!!!)
-    mimic_sample_similarity(trainer, p=0.1, iters_per_preemption=10, sec_per_iter=0.2,
+    # save_dir form: 'en-de-mimic-hybrid-ep10-p30-i10-*'
+    save_dir = cfg.checkpoint['save_dir'].split('/')[-1]
+    p = int(save_dir.split('-')[5][1:]) / 100
+    iters_per_preemption = int(save_dir.split('-')[6][1:])
+    mimic_sample_similarity(trainer, p=p, iters_per_preemption=iters_per_preemption, sec_per_iter=0.2,
                             delayed_grad=False, nsamples=1024, sim_func='l2norm')
 
     train_meter = meters.StopwatchMeter()
