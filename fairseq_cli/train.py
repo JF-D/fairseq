@@ -613,8 +613,9 @@ def mimic_delay_gradient(trainer, p=0.05, max_preempt_iters=20, drop_grad=False,
 
 
 class MimicPreemption:
-    def __init__(self, trainer, prob=0.1, iters_per_preemption=10, sec_per_iter=0.2, delayed_grad=False, seed=12345):
+    def __init__(self, trainer, prob=0.1, iters_per_preemption=10, sec_per_iter=0.2, delayed_grad=False, recovery_grad=False, seed=12345):
         self.delayed_grad = delayed_grad
+        self.recovery_grad = recovery_grad
 
         self.parameter_map = {}
         self.gradient_hist = {}
@@ -646,6 +647,10 @@ class MimicPreemption:
         print(f'[Mimic Preemption with Activation Gradient] prob: {prob}')
 
     def run(self):
+        if self.recovery_grad:
+            self.update += 1
+            return
+
         for i in range(len(self.trace_generators)):
             if self.trace_generators[i].check_preemption(self.update):
                 for name in self.partition[i]:
@@ -746,14 +751,14 @@ class SimiFunction(torch.autograd.Function):
             args = (synthetic_out.detach(), )
         return (None, None) + args
 
-def mimic_sample_similarity(trainer, p=0.05, iters_per_preemption=10, sec_per_iter=0.2, delayed_grad=False, nsamples=1024, sim_func='l2norm'):
+def mimic_sample_similarity(trainer, p=0.05, iters_per_preemption=10, sec_per_iter=0.2, delayed_grad=False, recovery_grad=False, nsamples=1024, sim_func='l2norm'):
     # generate seed
     seed = torch.tensor(random.randint(0, 123)).cuda()
     distributed_utils.all_reduce(seed, distributed_utils.get_data_parallel_group())
     seed = seed.item()
 
     hook = MimicPreemption(trainer, prob=p, iters_per_preemption=iters_per_preemption,
-                           sec_per_iter=sec_per_iter, delayed_grad=delayed_grad, seed=seed)
+                           sec_per_iter=sec_per_iter, delayed_grad=delayed_grad, recovery_grad=recovery_grad, seed=seed)
     trainer.hook_before_grad_reduce = hook.run
 
     def _pre_backward_module_hook(module, inputs, output):
@@ -942,7 +947,7 @@ def main(cfg: FairseqConfig) -> None:
     p = int(save_dir.split('-')[5][1:]) / 100
     iters_per_preemption = int(save_dir.split('-')[6][1:])
     mimic_sample_similarity(trainer, p=p, iters_per_preemption=iters_per_preemption, sec_per_iter=0.2,
-                            delayed_grad=False, nsamples=1024, sim_func='l2norm')
+                            delayed_grad=False, recovery_grad=False, nsamples=1024, sim_func='l2norm')
 
     train_meter = meters.StopwatchMeter()
     train_meter.start()
