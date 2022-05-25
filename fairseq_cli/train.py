@@ -644,7 +644,8 @@ class MimicPreemption:
                                             sec_per_iter=sec_per_iter, seed=seed)
 
         self.update = 0
-        print(f'[Mimic Preemption with Activation Gradient] prob: {prob}')
+        print(f'[Mimic Preemption with Activation Gradient] prob: {prob}, iters_per_preemption: {iters_per_preemption}, '
+              f'delayed_grad: {delayed_grad}, recovery_grad: {recovery_grad}, seed: {seed}, sec_per_iter: {sec_per_iter}')
 
     def run(self):
         if self.recovery_grad:
